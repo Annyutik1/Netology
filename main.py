@@ -1,170 +1,82 @@
-import psycopg2
+import vk_api
+from database import orm
+from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+from vk.vk_search import Search
+from config import VK_TOKEN_GROUP, VK_GROUP_ID
+from random import randrange
+
+API_VERSION = "5.131"
+SEARCH_BUTTON = "Найти"
+SHOW_BUTTON = "Показать ещё"
+START_REQUEST = "Привет"
+SEARCH_COUNT = 5
 
 
-def create_db(conn):
-    sql = """
-    create table if not exists clients(
-        client_id serial primary key,
-        first_name varchar(255) not null,
-        last_name varchar(255),
-        email varchar(255) not null unique
-    );
-    create table if not exists client_phones(
-        phone_id serial primary key,
-        client_id int not null references clients(client_id) on delete cascade,
-        phone varchar(25) not null unique
-    );
-    """
-    with conn.cursor() as curs:
-        curs.execute(sql)
+def create_keyboard():
+    keybord = VkKeyboard(one_time=False, inline=False)
+    keybord.add_button(SEARCH_BUTTON, VkKeyboardColor.PRIMARY)
+    keybord.add_button(SHOW_BUTTON, VkKeyboardColor.PRIMARY)
+    return keybord
 
 
-def get_client_id(conn, email):
-    with conn.cursor() as curs:
-        curs.execute("select client_id from clients where email = %s", (email,))
-        row = curs.fetchone()
-        if row is not None:
-            return row[0]
-        else:
-            return None
+def write_msg(vk_session, user_id, message, keyboard=None, attachments=[]):
+    values = {"user_id": user_id, "message": message,
+              "random_id": randrange(10 ** 7), }
+    if keyboard:
+        values["keyboard"] = keyboard.get_keyboard()
+    if attachments:
+        values["attachment"] = ",".join(filter(None, attachments))
+    vk_session.method("messages.send", values)
 
 
-def client_exists(conn, client_id):
-    with conn.cursor() as curs:
-        curs.execute("select client_id from clients where client_id = %s", (client_id,))
-        return curs.fetchone() is not None
+def main():
+    keyboard = create_keyboard()
+    vk_session = vk_api.VkApi(token=VK_TOKEN_GROUP, api_version=API_VERSION)
+    longpoll = VkLongPoll(vk_session, group_id=VK_GROUP_ID)
+
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            request = event.text.lower().strip()
+            search = Search()
+
+            if request == START_REQUEST.lower():
+                user = search.get_user(event.user_id)
+                city = None
+                if user.get("city"):
+                    city = user.get("city").get("title")
+                orm.add_user(id_vk=event.user_id, bdate=user["bdate"],
+                             sex=user["sex"], city=city)
+                write_msg(vk_session, event.user_id,
+                          f"Новый поиск: {SEARCH_BUTTON}",
+                          keyboard)
+            elif request == SEARCH_BUTTON.lower():
+                write_msg(vk_session, event.user_id, "Поиск...", keyboard)
+                cnt = orm.get_match_count(event.user_id)
+                users = search.search_users(
+                    event.user_id, count=SEARCH_COUNT, offset=cnt)
+                for user in users:
+                    photos = search.get_user_photos(user)
+                    orm.add_match(id_vk=event.user_id,
+                                  id_vk_match=user, photos=photos)
+                write_msg(vk_session, event.user_id,
+                          f"Добавлено: {len(users)}", keyboard)
+            elif request == SHOW_BUTTON.lower():
+                match = orm.show_next_match(id_vk=event.user_id)
+                if match:
+                    write_msg(vk_session, event.user_id,
+                              f"https://vk.com/id{match.id_vk_match}",
+                              keyboard,
+                              [match.photo1, match.photo2, match.photo3])
+                    orm.set_match_showed(match.id_match)
+                else:
+                    write_msg(vk_session, event.user_id,
+                              f"Нет записей. Новый поиск: {SEARCH_BUTTON}",
+                              keyboard)
+            else:
+                write_msg(vk_session, event.user_id,
+                          "Неизвестный запрос", keyboard)
 
 
-def add_client(conn, first_name, last_name, email, phone=None):
-    with conn.cursor() as curs:
-        client_id = get_client_id(conn, email)
-        if client_id:
-            return "Error: client already exists"
-        curs.execute(
-            """
-            insert into clients(first_name, last_name, email)
-            values(%s, %s, %s) returning client_id
-            """,
-            (first_name, last_name, email))
-        client_id = curs.fetchone()[0]
-        if phone:
-            res = add_phone(conn, client_id, phone)
-            if res != "OK":
-                conn.rollback()
-                return f"Error: {res}"
-        conn.commit()
-        return "OK"
-
-
-def add_phone(conn, client_id, phone):
-    if not client_exists(conn, client_id):
-        return "Error: client does not exist"
-    with conn.cursor() as curs:
-        curs.execute(
-            """
-            select phone_id from client_phones where phone = %s
-            """, (phone,))
-        if curs.fetchone():
-            return "Error: phone already exists"
-        curs.execute(
-            """
-            insert into client_phones(client_id, phone) values(%s, %s)
-            """, (client_id, phone))
-        conn.commit()
-        return "OK"
-
-
-def change_client(conn, client_id, first_name=None, last_name=None, email=None):
-    if not client_exists(conn, client_id):
-        return "Error: client does not exist"
-    if first_name:
-        with conn.cursor() as curs:
-            curs.execute(
-                """
-                update clients set first_name=%s where client_id=%s
-                """, (first_name, client_id))
-    if last_name:
-        with conn.cursor() as curs:
-            curs.execute(
-                """
-                update clients set last_name=%s where client_id=%s
-                """, (last_name, client_id))
-    if email:
-        with conn.cursor() as curs:
-            curs.execute(
-                """
-                update clients set email=%s where client_id=%s
-                """, (email, client_id))
-    conn.commit()
-    return "OK"
-
-
-def delete_phone(conn, client_id, phone):
-    if not client_exists(conn, client_id):
-        return "Error: client does not exist"
-    with conn.cursor() as curs:
-        curs.execute(
-            """
-            delete from client_phones where client_id=%s and phone=%s
-            """, (client_id, phone))
-        conn.commit()
-        return "OK"
-
-
-def delete_client(conn, client_id):
-    if not client_exists(conn, client_id):
-        return "Error: client does not exist"
-    with conn.cursor() as curs:
-        curs.execute(
-            """
-            delete from clients where client_id=%s
-            """, (client_id,))
-        conn.commit()
-        return "OK"
-
-
-def find_client(conn, first_name=None, last_name=None, email=None, phone=None):
-    if first_name is None:
-        first_name = '%'
-    if last_name is None:
-        last_name = '%'
-    if email is None:
-        email = '%'
-    param_list = [first_name, last_name, email]
-    sql_phone = ''
-    if phone is None:
-        phone = '%'
-    else:
-        sql_phone = " and phone = %s::text"
-        param_list.append(phone)
-    with conn.cursor() as curs:
-        sql = f"""
-            select c.client_id, c.first_name, c.last_name, c.email,
-            case when array_agg(p.phone) = '{{Null}}' then array[]::text[]
-                 else array_agg(p.phone)
-            end as phones
-            from clients c
-            left join client_phones p
-            on c.client_id = p.client_id
-            where c.first_name like %s
-            and c.last_name like %s
-            and c.email like %s
-            {sql_phone}
-            group by c.client_id, c.first_name, c.last_name, c.email
-            """
-        curs.execute(sql, param_list)
-        return curs.fetchall()
-
-
-with psycopg2.connect(database="test", user="postgres", password="postgres") as conn:
-    create_db(conn)
-    add_client(conn, "John", "Smith", "js@mail.ru")
-    add_client(conn, "Johnny", "Smitson", "jsmit@mail.ru", "89501234567")
-    add_phone(conn, 1, "89619876543")
-    add_phone(conn, 1, "81234567890")
-    change_client(conn, 1, "David", "Clark", "david@mail.ru")
-    delete_phone(conn, 2, "89501234567")
-    delete_client(conn, 2)
-    print(find_client(conn, "David"))
-    print(find_client(conn, "David", "Clark", "david@mail.ru", "89619876543"))
-    print(find_client(conn, None, None, None, "89619876543"))
+if __name__ == "__main__":
+    main()
